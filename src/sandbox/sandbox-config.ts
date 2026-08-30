@@ -1034,6 +1034,72 @@ export const WindowsConfigSchema = z.object({
 })
 
 /**
+ * Filesystem approval schema (macOS only): directories constrained to
+ * read/write/delete under interactive user approval.
+ *
+ * The `mounts` list declares constrained directories (see FsMountConfig).
+ * At wrap time the mount paths are unioned into the Seatbelt read
+ * allowWithinDeny / write allowOnly sets (the static boundary), and the
+ * DYLD interposer prompts the approval server for ops under
+ * `requireApproval: true` mounts. The headless ask callback is NOT part
+ * of this schema — it is a function and is registered via
+ * `SandboxManager.initialize()` options.
+ */
+export const FsApprovalConfigSchema = z.object({
+  mounts: z
+    .array(
+      z.object({
+        path: filesystemPathSchema.describe(
+          'Absolute path (or ~-expandable) of the constrained directory.',
+        ),
+        ops: z
+          .array(z.enum(['read', 'write', 'delete']))
+          .min(1)
+          .describe(
+            'Which operations under this path are subject to approval.',
+          ),
+        requireApproval: z
+          .boolean()
+          .optional()
+          .describe(
+            'Default true. false = static allow only, never prompts ' +
+              '(use for interpreter runtime dirs like site-packages).',
+          ),
+      }),
+    )
+    .optional()
+    .describe(
+      'Directories constrained to read/write/delete under interactive ' +
+        'user approval (macOS only).',
+    ),
+  /**
+   * How long the interposer waits for the approval server before denying
+   * (fail-closed). Default 5000ms. A slow callback (e.g. a human reading
+   * a prompt) should be answered before this fires.
+   */
+  timeoutMs: z
+    .number()
+    .int()
+    .min(100)
+    .max(120000)
+    .optional()
+    .describe(
+      'Interposer → approval server response timeout in ms (default 5000).',
+    ),
+  /**
+   * Max concurrent in-flight approval requests per pid; beyond this the
+   * server denies immediately (prompt-flood protection). Default 3.
+   */
+  maxInflightPerPid: z
+    .number()
+    .int()
+    .min(1)
+    .max(64)
+    .optional()
+    .describe('Max concurrent in-flight approvals per pid (default 3).'),
+})
+
+/**
  * Seccomp configuration schema (Linux only)
  */
 export const SeccompConfigSchema = z.object({
@@ -1131,6 +1197,11 @@ export const SandboxRuntimeConfigSchema = z
           'When set, used instead of looking under vendor/java-proxy-agent/. ' +
           'For consumers that bundle sandbox-runtime and ship the jar separately.',
       ),
+    fsApproval: FsApprovalConfigSchema.optional().describe(
+      'Filesystem operation approval (macOS only): constrain directories ' +
+        'to read/write/delete under interactive user approval. The headless ' +
+        'ask callback is registered via SandboxManager.initialize() options.',
+    ),
     windows: WindowsConfigSchema.optional().describe(
       'Windows-specific settings (WFP sublayer, proxy port range).',
     ),
@@ -1402,6 +1473,7 @@ export type IgnoreViolationsConfig = z.infer<
 export type RipgrepConfig = z.infer<typeof RipgrepConfigSchema>
 export type GitConfig = z.infer<typeof GitConfigSchema>
 export type SeccompConfig = z.infer<typeof SeccompConfigSchema>
+export type FsApprovalConfig = z.infer<typeof FsApprovalConfigSchema>
 export type SrtWinConfig = z.infer<typeof SrtWinConfigSchema>
 export type WindowsConfig = z.infer<typeof WindowsConfigSchema>
 export type SandboxRuntimeConfig = z.infer<typeof SandboxRuntimeConfigSchema>

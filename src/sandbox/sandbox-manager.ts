@@ -35,10 +35,17 @@ import type {
 import type {
   SandboxAskCallback,
   CredentialRestrictionConfig,
+  FsAskCallback,
   FsReadRestrictionConfig,
   FsWriteRestrictionConfig,
   NetworkRestrictionConfig,
 } from './sandbox-schemas.js'
+import { FsApprovalServer } from './fs-approval.js'
+import {
+  createFsApprovalSocketPath,
+  resolveFsInterposerDylibPath,
+  resolveFsLauncherPath,
+} from './fs-interposer.js'
 import {
   wrapCommandWithSandboxLinux,
   initializeLinuxNetworkBridge,
@@ -138,6 +145,17 @@ let javaAgentJarPath: string | undefined
 // the sandbox child env, checked on every CONNECT/request — so a host process
 // dialing 127.0.0.1:<proxyPort> can't reach the filter callback.
 let proxyAuthToken: string | undefined
+/**
+ * Filesystem approval (macOS): host-side approval server + the vendor
+ * interposer/launcher paths + the headless ask callback registered at
+ * initialize() time. Started lazily in initialize() when
+ * `config.fsApproval.mounts` is configured; torn down in reset().
+ */
+let fsApprovalServer: FsApprovalServer | undefined
+let fsAskCallback: FsAskCallback | undefined
+let fsApprovalSocketPath: string | undefined
+let fsInterposerDylibPath: string | undefined
+let fsLauncherPath: string | undefined
 // Windows: the resolved access set that was actually applied at
 // initialize(). `undefined` means no stamp/grant was applied
 // (gates running `acl restore`/`acl revoke` at reset()).
@@ -599,11 +617,27 @@ async function startMuxProxyServer(
 // Public Module Functions (will be exported via namespace)
 // ============================================================================
 
+/**
+ * Extra per-session options for {@link initialize} that can't live in the
+ * JSON config because they are functions (the config is validated by zod,
+ * which strips non-serializable values).
+ */
+export interface InitializeOptions {
+  /**
+   * Headless approval callback for filesystem operations under
+   * `fsApproval.mounts` (macOS). Omitted → fs approval denies
+   * fail-closed (no prompt source).
+   */
+  fsAskCallback?: FsAskCallback
+}
+
 async function initialize(
   runtimeConfig: SandboxRuntimeConfig,
   sandboxAskCallback?: SandboxAskCallback,
   enableLogMonitor = false,
+  options: InitializeOptions = {},
 ): Promise<void> {
+  fsAskCallback = options.fsAskCallback
   // Return if already initializing
   if (initializationPromise) {
     await initializationPromise
@@ -684,6 +718,45 @@ async function initialize(
     // fs.existsSync(observeSocketPath) and degrades gracefully.
     void linuxMonitor.ready
     logForDebugging('Started Linux seccomp violation monitor')
+  }
+
+  // Start the fs-approval server (macOS) when mounts are configured. The
+  // vendor interposer/launcher are release-built (npm run
+  // build:fs-interposer); without them the mount paths still expand into
+  // the Seatbelt static rules, but no interactive prompts happen.
+  const fsApprovalConfig = runtimeConfig.fsApproval
+  if (
+    getPlatform() === 'macos' &&
+    fsApprovalConfig?.mounts &&
+    fsApprovalConfig.mounts.length > 0
+  ) {
+    const dylib = resolveFsInterposerDylibPath()
+    const launcher = resolveFsLauncherPath()
+    if (!dylib || !launcher) {
+      logForDebugging(
+        '[FsApproval] interposer/launcher not built; interactive approval ' +
+          'disabled for this session (run `npm run build:fs-interposer`)',
+        { level: 'warn' },
+      )
+    } else {
+      fsInterposerDylibPath = dylib
+      fsLauncherPath = launcher
+      fsApprovalSocketPath = createFsApprovalSocketPath()
+      fsApprovalServer = new FsApprovalServer({
+        socketPath: fsApprovalSocketPath,
+        mounts: fsApprovalConfig.mounts,
+        askCallback: fsAskCallback,
+        resolveCommandText,
+        onViolation: recordProxyViolation,
+        timeoutMs: fsApprovalConfig.timeoutMs,
+        maxInflightPerPid: fsApprovalConfig.maxInflightPerPid,
+      })
+      await fsApprovalServer.start()
+      logForDebugging(
+        `[FsApproval] server listening on ${fsApprovalSocketPath} for ` +
+          `${fsApprovalConfig.mounts.length} mount(s)`,
+      )
+    }
   }
 
   // Register cleanup handlers first time
@@ -1685,6 +1758,21 @@ async function wrapWithSandbox(
         enableWeakerNetworkIsolation: getEnableWeakerNetworkIsolation(),
         allowAppleEvents: getAllowAppleEvents(),
         binShell,
+        fsApproval:
+          fsApprovalServer && fsApprovalSocketPath
+            ? {
+                mounts:
+                  customConfig?.fsApproval?.mounts ??
+                  config?.fsApproval?.mounts ??
+                  [],
+                timeoutMs:
+                  customConfig?.fsApproval?.timeoutMs ??
+                  config?.fsApproval?.timeoutMs,
+              }
+            : undefined,
+        approvalSocketPath: fsApprovalSocketPath,
+        interposerDylibPath: fsInterposerDylibPath,
+        fsLauncherPath: fsLauncherPath,
       })
 
     case 'linux':
@@ -2129,6 +2217,21 @@ async function reset(): Promise<void> {
     linuxMonitor = undefined
   }
 
+  // Stop the fs-approval server and clear the session state.
+  if (fsApprovalServer) {
+    const server = fsApprovalServer
+    fsApprovalServer = undefined
+    await server.close().catch((error: Error) => {
+      logForDebugging(`Error closing fs approval server: ${error.message}`, {
+        level: 'error',
+      })
+    })
+  }
+  fsAskCallback = undefined
+  fsApprovalSocketPath = undefined
+  fsInterposerDylibPath = undefined
+  fsLauncherPath = undefined
+
   if (managerContext?.linuxBridge) {
     const {
       httpSocketPath,
@@ -2290,6 +2393,7 @@ export interface ISandboxManager {
     runtimeConfig: SandboxRuntimeConfig,
     sandboxAskCallback?: SandboxAskCallback,
     enableLogMonitor?: boolean,
+    options?: InitializeOptions,
   ): Promise<void>
   isSupportedPlatform(): boolean
   isSandboxingEnabled(): boolean

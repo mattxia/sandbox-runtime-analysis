@@ -1,6 +1,9 @@
 // Library exports
 export { SandboxManager } from './sandbox/sandbox-manager.js'
-export type { WrapWithSandboxOptions } from './sandbox/sandbox-manager.js'
+export type {
+  WrapWithSandboxOptions,
+  InitializeOptions,
+} from './sandbox/sandbox-manager.js'
 export { SandboxViolationStore } from './sandbox/sandbox-violation-store.js'
 
 // Configuration types and schemas
@@ -13,6 +16,7 @@ export type {
   CredentialEnvVarConfig,
   CredentialMode,
   IgnoreViolationsConfig,
+  FsApprovalConfig,
 } from './sandbox/sandbox-config.js'
 
 export {
@@ -22,11 +26,18 @@ export {
   CredentialsConfigSchema,
   IgnoreViolationsConfigSchema,
   RipgrepConfigSchema,
+  FsApprovalConfigSchema,
 } from './sandbox/sandbox-config.js'
 
 // Schema types and utilities
 export type {
   SandboxAskCallback,
+  FsApprovalOp,
+  FsMountConfig,
+  FsAskParams,
+  FsAskScope,
+  FsAskResult,
+  FsAskCallback,
   FsReadRestrictionConfig,
   FsWriteRestrictionConfig,
   CredentialRestrictionConfig,

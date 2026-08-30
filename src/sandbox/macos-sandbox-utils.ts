@@ -18,10 +18,12 @@ import {
 import { shouldIgnoreViolation } from './sandbox-violation-store.js'
 
 import type {
+  FsMountConfig,
   FsReadRestrictionConfig,
   FsWriteRestrictionConfig,
 } from './sandbox-schemas.js'
 import type { IgnoreViolationsConfig } from './sandbox-config.js'
+import { buildFsApprovalEnvVars } from './fs-interposer.js'
 
 export interface MacOSSandboxParams {
   command: string
@@ -70,6 +72,22 @@ export interface MacOSSandboxParams {
   enableWeakerNetworkIsolation?: boolean
   allowAppleEvents?: boolean
   binShell?: string
+  /**
+   * Filesystem approval (DYLD interposer) config. When set, mount paths
+   * are unioned into the Seatbelt read/write rules (static boundary) and
+   * the interposer asks the approval server before ops under
+   * `requireApproval` mounts proceed.
+   */
+  fsApproval?: {
+    mounts: FsMountConfig[]
+    timeoutMs?: number
+  }
+  /** Session approval-server socket path (fs-approval.ts). */
+  approvalSocketPath?: string
+  /** Path to libsrtfs_approve.dylib (vendor build artifact). */
+  interposerDylibPath?: string
+  /** Path to the srt-launcher helper (vendor build artifact). */
+  fsLauncherPath?: string
 }
 
 /**
@@ -1009,7 +1027,7 @@ export function wrapCommandWithSandboxMacOS(
     allowLocalBinding,
     allowMachLookup,
     readConfig: readConfigIn,
-    writeConfig,
+    writeConfig: writeConfigIn,
     unsetEnvVars,
     setEnvVars,
     maskedFileBinds,
@@ -1019,7 +1037,12 @@ export function wrapCommandWithSandboxMacOS(
     enableWeakerNetworkIsolation = false,
     allowAppleEvents = false,
     binShell,
+    fsApproval,
+    approvalSocketPath,
+    interposerDylibPath,
+    fsLauncherPath,
   } = params
+  let writeConfig = writeConfigIn
 
   // SBPL cannot redirect a read to different bytes, so whole-file masking
   // degrades to read-deny on macOS: the sandboxed process gets EPERM
@@ -1038,6 +1061,36 @@ export function wrapCommandWithSandboxMacOS(
         ...maskedFileBinds.map(b => b.realPath),
       ],
       allowWithinDeny: readConfigIn?.allowWithinDeny,
+    }
+  }
+
+  // Filesystem approval mounts: the mount paths are the static boundary —
+  // unioned into the read allowWithinDeny (so a caller's denyRead: ['/**']
+  // or /Users carve-out still lets the mount through) and the write
+  // allowOnly. The interposer then gates ops under the requireApproval
+  // mounts on the approval server.
+  const approvalActive =
+    fsApproval !== undefined &&
+    fsApproval.mounts.length > 0 &&
+    approvalSocketPath !== undefined &&
+    interposerDylibPath !== undefined &&
+    fsLauncherPath !== undefined
+  if (fsApproval && fsApproval.mounts.length > 0) {
+    const mountPaths = fsApproval.mounts.map(m =>
+      normalizePathForSandbox(m.path),
+    )
+    const readAllow = [...(readConfig?.allowWithinDeny ?? []), ...mountPaths]
+    readConfig = {
+      denyOnly: readConfig?.denyOnly ?? [],
+      allowWithinDeny: readAllow,
+    }
+    // Writes: mounts are writable area (on top of the caller's allowWrite
+    // and the default system write paths already in writeConfig).
+    if (writeConfig) {
+      writeConfig = {
+        ...writeConfig,
+        allowOnly: [...writeConfig.allowOnly, ...mountPaths],
+      }
     }
   }
 
@@ -1074,7 +1127,12 @@ export function wrapCommandWithSandboxMacOS(
     httpProxyPort,
     socksProxyPort,
     needsNetworkRestriction,
-    allowUnixSockets,
+    // The interposer must be able to connect to the approval server
+    // socket; when network restriction is on, the unix-socket allowlist
+    // would otherwise block it.
+    allowUnixSockets: approvalActive
+      ? [...(allowUnixSockets ?? []), approvalSocketPath!]
+      : allowUnixSockets,
     allowAllUnixSockets,
     allowLocalBinding,
     allowMachLookup,
@@ -1128,6 +1186,25 @@ export function wrapCommandWithSandboxMacOS(
     proxyEnvArgs.push(`JAVA_TOOL_OPTIONS=${javaToolOptions}`)
   }
 
+  // Filesystem approval plumbing: point the interposer at the approval
+  // server and hand it the mount dirs and attribution tag. Only
+  // requireApproval mounts are listed — requireApproval:false dirs are
+  // static allow and must never prompt.
+  if (approvalActive) {
+    const approvalDirs = fsApproval!.mounts
+      .filter(m => m.requireApproval !== false)
+      .map(m => normalizePathForSandbox(m.path))
+    proxyEnvArgs.push(
+      ...buildFsApprovalEnvVars({
+        socketPath: approvalSocketPath!,
+        approvalDirs,
+        timeoutMs: fsApproval?.timeoutMs,
+        encodedCommand: encodeSandboxedCommand(attributionCommand),
+        interposerDylibPath: interposerDylibPath!,
+      }),
+    )
+  }
+
   // safe.directory (dubious-ownership) — `buildPosixGitSafeDirEnv`
   // composes against the child's actual starting env (process.env
   // inherited under sandbox-exec, unsetEnvVars dropped, setEnvVars
@@ -1152,6 +1229,23 @@ export function wrapCommandWithSandboxMacOS(
     throw new Error(`Shell '${shellName}' not found in PATH`)
   }
 
+  // The interposer only loads into non-restricted binaries: Apple-signed
+  // system binaries (which strip DYLD_* at exec) can't carry it. Warn when
+  // the wrapping shell is one of them so a silent loss of approval prompts
+  // is debuggable.
+  if (
+    approvalActive &&
+    (shell.startsWith('/bin/') || shell.startsWith('/usr/bin/'))
+  ) {
+    logForDebugging(
+      `[Sandbox macOS] fs approval: wrapping shell ${shell} is a system ` +
+        `binary — DYLD interposition will not apply. Use a non-Apple ` +
+        `shell (e.g. a Homebrew bash/zsh) so read/write/delete prompts ` +
+        `work; Seatbelt still enforces the mount boundary.`,
+      { level: 'warn' },
+    )
+  }
+
   // Drop denied credential env vars from the inherited environment. The -u
   // flags must precede the VAR=VALUE assignments so SRT's own proxy plumbing
   // vars survive even if a caller lists one of them as a denied credential.
@@ -1165,6 +1259,14 @@ export function wrapCommandWithSandboxMacOS(
 
   // Use `env` command to set environment variables - each VAR=value is a separate
   // argument that quote() escapes properly, avoiding shell quoting issues
+  //
+  // With fs approval active, sandbox-exec execs the srt-launcher instead of
+  // the shell directly: sandbox-exec strips DYLD_* from its environment, so
+  // the launcher re-injects them (from SRT_INTERPOSER_DYLIB) before exec'ing
+  // the shell — otherwise the interposer would never load.
+  const execTarget = approvalActive
+    ? [fsLauncherPath!, shell, '-c', command]
+    : [shell, '-c', command]
   const wrappedCommand = quote([
     'env',
     ...unsetEnvArgs,
@@ -1173,9 +1275,7 @@ export function wrapCommandWithSandboxMacOS(
     '/usr/bin/sandbox-exec',
     '-p',
     profile,
-    shell,
-    '-c',
-    command,
+    ...execTarget,
   ])
 
   logForDebugging(

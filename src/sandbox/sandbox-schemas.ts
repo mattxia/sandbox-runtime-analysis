@@ -103,3 +103,70 @@ export type NetworkHostPattern = {
 export type SandboxAskCallback = (
   params: NetworkHostPattern,
 ) => Promise<boolean>
+
+/**
+ * A filesystem operation that may require interactive approval on a
+ * constrained (mount) directory.
+ *
+ * - `read`: open() without a write intent (O_RDONLY etc.)
+ * - `write`: open() with a write intent, or mkdir/truncate
+ * - `delete`: unlink / rename / rmdir — anything that removes or moves
+ *   an existing path out from under its current name
+ */
+export type FsApprovalOp = 'read' | 'write' | 'delete'
+
+/**
+ * A constrained directory whose filesystem operations are gated on
+ * user approval (macOS: the DYLD interposer + approval server).
+ *
+ * - `requireApproval: true` (default): read/write/delete ops on paths
+ *   beneath `path` ask the registered FsAskCallback before proceeding.
+ * - `requireApproval: false`: the directory is only statically allowed
+ *   (Seatbelt) and never prompts — use for interpreter runtime dirs
+ *   (site-packages etc.) whose reads would otherwise prompt on every
+ *   process start.
+ */
+export interface FsMountConfig {
+  /** Absolute path (or ~-expandable) of the constrained directory. */
+  path: string
+  /** Which ops under this path are subject to approval. */
+  ops: FsApprovalOp[]
+  /** Default true. false = static allow only, never prompts. */
+  requireApproval?: boolean
+}
+
+export interface FsAskParams {
+  op: FsApprovalOp
+  /** Absolute path that triggered the approval. */
+  path: string
+  /** Attributed command (decoded from the interposer's cmd tag). */
+  command?: string
+  /** Process name reported by the interposer. */
+  processName?: string
+  pid?: number
+}
+
+/** How long an approved verdict stays effective (session-scoped). */
+export type FsAskScope = 'once' | 'session' | 'always'
+
+export interface FsAskResult {
+  allow: boolean
+  /**
+   * Effective lifetime of the allow. Default `once` (the next identical
+   * operation asks again). `session`/`always` cache op+path for the rest
+   * of the sandbox session. Reads are always cached at session scope by
+   * the approval server regardless of this value (first-visit semantics).
+   */
+  scope?: FsAskScope
+  /** Deny/allow explanation; also recorded into the violation store. */
+  reason?: string
+}
+
+/**
+ * Headless approval callback for filesystem operations under constrained
+ * mount directories. Registered via `SandboxManager.initialize()` options
+ * (it cannot live in the JSON config — it's a function). Return
+ * `{allow: false}` to deny; a throwing/unresolved callback denies
+ * (fail-closed).
+ */
+export type FsAskCallback = (params: FsAskParams) => Promise<FsAskResult>

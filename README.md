@@ -284,6 +284,17 @@ srt --settings /path/to/srt-settings.json <command>
     "allowWrite": [".", "src/", "test/", "/tmp"],
     "denyWrite": [".env", "config/production.json"]
   },
+  "fsApproval": {
+    "mounts": [
+      {
+        "path": "/tmp/app-data",
+        "ops": ["read", "write", "delete"],
+        "requireApproval": true
+      }
+    ],
+    "timeoutMs": 5000,
+    "maxInflightPerPid": 3
+  },
   "ignoreViolations": {
     "*": ["/usr/bin", "/System"],
     "git push": ["/usr/bin/nc"],
@@ -382,6 +393,16 @@ Examples:
 
 - Paths can be absolute (e.g., `/home/user/.ssh`) or relative to the current working directory (e.g., `./src`)
 - `~` expands to the user's home directory
+
+#### Filesystem Approval (macOS)
+
+Per-operation **user approval** for constrained mount directories (macOS only). Mount paths are unioned into the Seatbelt profile as a static boundary (they are readable/writable inside the sandbox), and a DYLD interposer asks the host-side approval server before a read, write, or delete under a `requireApproval` mount proceeds:
+
+- `fsApproval.mounts` - Array of `{ path, ops, requireApproval? }`. `path` is an absolute directory; `ops` is a subset of `["read", "write", "delete"]`; `requireApproval` defaults to `true` — set `false` for interpreter runtime dirs (site-packages etc.) that should be statically allowed but never prompt.
+- `fsApproval.timeoutMs` - Approval callback deadline in ms (default `5000`). A timeout denies the operation (fail-closed).
+- `fsApproval.maxInflightPerPid` - Max concurrent pending approvals per sandboxed process (default `3`); excess requests are denied immediately (prompt-flood protection).
+
+Approvals are resolved by the callback registered at `initialize()` (`options.fsAskCallback`, headless — it cannot live in the JSON settings file). Verdicts are **session-scoped** and never persisted: reads are approved once per path for the session (first-visit); writes/deletes ask every time unless the callback returns `scope: "session"`/`"always"`. Every approval and denial is recorded into the violation store as an `fs-approval` line attributed to the wrapped command. See "Filesystem Approval (macOS)" under Implementation Details for the mechanics and requirements.
 
 #### Other Configuration
 
@@ -505,6 +526,7 @@ The package includes pre-generated seccomp BPF filters for x86-64 and arm archit
 - `ripgrep` - Fast search tool for deny path detection
   - Install via Homebrew: `brew install ripgrep`
   - Or download from: https://github.com/BurntSushi/ripgrep/releases
+- `clang` (Xcode Command Line Tools) - Only needed to **rebuild** the filesystem-approval interposer from source (`npm run build:fs-interposer`). The npm package ships prebuilt `libsrtfs_approve.dylib` / `srt-launcher` for x64 and arm64.
 
 **Windows requires:**
 
@@ -724,6 +746,29 @@ On Linux, the sandbox uses **seccomp BPF (Berkeley Packet Filter)** to block Uni
 
 **Architecture support**: x64 and arm64 are fully supported with pre-built binaries. Other architectures are not currently supported. To use sandboxing without Unix socket blocking on unsupported architectures, set `allowAllUnixSockets: true` in your configuration.
 
+### Filesystem Approval (macOS)
+
+`fsApproval` implements **per-operation user consent** on top of the existing Seatbelt boundary: the mount directories are unioned into the profile's read/write rules (so they are statically reachable), and an interposed libc intercepts `open/openat/read/write/unlink/rename/rmdir/mkdir/truncate/ftruncate` calls that touch them, asking the host-side approval server before the syscall proceeds.
+
+**How it works:**
+
+1. **Seatbelt boundary (L1)**: `macos-sandbox-utils` expands each mount into `allowWithinDeny` (read side) and `allowOnly` (write side), so the sandboxed process can reach the mount paths at the OS level.
+2. **DYLD interposer (L2)**: the sandboxed child is launched with a bundled `libsrtfs_approve.dylib` (via `DYLD_INSERT_LIBRARIES` + `DYLD_FORCE_FLAT_NAMESPACE`) plus `SRT_APPROVE_SOCKET`, `SRT_APPROVE_DIRS`, `SRT_APPROVE_TIMEOUT_MS`, and `SRT_ATTRIBUTION` env vars. Because `/usr/bin/sandbox-exec` strips `DYLD_*` at exec, the command is actually launched through the bundled `srt-launcher` helper, which re-injects the vars from `SRT_INTERPOSER_DYLIB` inside the sandbox and then execs the shell.
+3. **Approval server**: at `initialize()`, `SandboxManager` starts an `FsApprovalServer` on a per-session Unix socket (`/tmp/srt-fsapprove-<hex>_SBX.sock`). The interposer connects per request and sends `{v, id, op, path, pid, proc, cmd}` (newline-delimited JSON); the server answers `{id, allow, scope, reason}`.
+4. **Verdict semantics**: reads are approved once per normalized path and cached for the session (first-visit). Writes/deletes default to `once` — every identical op asks again — unless the callback returns `scope: "session"` or `"always"`, which caches for the session. Denials are never cached.
+5. **Fail-closed**: a missing callback, a throwing or timing-out callback (`timeoutMs`), an over-limit in-flight count (`maxInflightPerPid`), a malformed request, or a request outside the mounted paths all deny with `EPERM`/an approval rejection. The interposer enforces its own response timeout too, so a dead server cannot hang the process.
+6. **Attribution**: every approval/denial is recorded into the violation store as an `fs-approval <allow|deny> <op> <path> (<reason>)` line tagged with the wrapped command (same encoded-command scheme as proxy denials), so the model sees the agent's filesystem actions in the transcript.
+
+**Building the interposer:** the dylib and launcher are compiled from `vendor/srt-macos-interposer-src/` and shipped under `vendor/srt-macos-interposer/<arch>/`. Consumers that bundle the package ship these artifacts; a plain npm install resolves them automatically. To rebuild from source (requires the Xcode Command Line Tools, i.e. `clang`):
+
+```bash
+npm run build:fs-interposer
+```
+
+When the binaries are missing, `initialize()` logs a warning and the session continues with the mount directories statically allowed but **without** interactive approval.
+
+**Known limitation:** Apple-signed system binaries (e.g. `/bin/ls`, `/usr/bin/python3`) strip `DYLD_*` environment variables when they exec, so a child that execs a system binary directly bypasses the interposer's consent gate for that process. The static Seatbelt rules still apply. The launcher re-injection covers the common Python/Node/Shell paths; wrap commands that must stay gated with non-system interpreter binaries when strict per-op consent is required.
+
 ### Violation Detection and Monitoring
 
 When a sandboxed process attempts to access a restricted resource:
@@ -784,6 +829,7 @@ Users should be aware of potential risks that come from allowing broad domains l
 - Linux Sandbox Strength: The Linux implementation provides strong filesystem and network isolation but includes an `enableWeakerNestedSandbox` mode that enables it to work inside of Docker environments without privileged namespaces. This option considerably weakens security and should only be used in cases where additional isolation is otherwise enforced.
 - Weaker Network Isolation (macOS): The `enableWeakerNetworkIsolation` option re-enables access to `com.apple.trustd.agent`, which is needed for Go programs to verify TLS certificates via the macOS Security framework. This opens a potential data exfiltration vector through the trustd service and should only be enabled when Go TLS verification is required (e.g., when using `httpProxyPort` with a MITM proxy and custom CA).
 - Apple Events (macOS): The `allowAppleEvents` option re-enables sending Apple Events and Launch Services open requests (`(allow appleevent-send)`, `(allow lsopen)`, and mach-lookups for `com.apple.coreservices.appleevents`, `com.apple.CoreServices.coreservicesd`, and `com.apple.coreservices.quarantine-resolver`), which `open`, `osascript`, and URL-opening helpers require. With these allowed, a sandboxed command can launch arbitrary applications with no user prompt, and launched applications run outside the sandbox entirely — so this option removes code-execution isolation, not just weakens it. Scripting already-running applications via Apple Events is additionally gated by macOS TCC automation consent, but launching via `open` is not. Only enable this when commands inside the sandbox genuinely need to open URLs or applications.
+- Filesystem Approval (macOS): `fsApproval` is a **consent gate, not a security boundary**. It does not weaken the Seatbelt profile — mount directories are statically allowed regardless — it adds a per-operation ask on top. A malicious sandboxed process can block its own prompts by exec'ing an Apple-signed system binary (which strips `DYLD_*`, bypassing the interposer), so approvals must be treated as a user-notice mechanism whose enforcement assumes cooperative children. Trust the verdict of a deny just as little: the interposer is a userspace library and can be unloaded by a process that deliberately evades it. See "Filesystem Approval (macOS)" under Implementation Details.
 
 ### Known Limitations and Future Work
 
